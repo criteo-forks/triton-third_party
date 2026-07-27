@@ -67,6 +67,7 @@ struct evthr_pool {
     int wdr;
 #endif
     int                nthreads;
+    unsigned int       rr_next;
     evthr_pool_slist_t threads;
 };
 
@@ -404,9 +405,11 @@ evthr_pool_defer(evthr_pool_t * pool, evthr_cb cb, void * arg)
 
     return EVTHR_RES_OK;
 #endif
-    evthr_t * thread      = NULL;
-    evthr_t * min_thread  = NULL;
-    int       min_backlog = 0;
+    evthr_t    * thread      = NULL;
+    evthr_t    * min_thread  = NULL;
+    int          min_backlog = 0;
+    unsigned int skip;
+    unsigned int i;
 
     if (pool == NULL) {
         return EVTHR_RES_FATAL;
@@ -416,8 +419,47 @@ evthr_pool_defer(evthr_pool_t * pool, evthr_cb cb, void * arg)
         return EVTHR_RES_NOCB;
     }
 
+    /* Rotate the point at which the scan starts, so that the search below is
+     * not biased toward the head of the thread list.
+     *
+     * Scanning from the head every time means the first thread with a drained
+     * backlog wins every time, and a backlog drains in microseconds.  For
+     * short-lived deferrals that is harmless, but when the deferred work is a
+     * *connection* (evhtp defers each accepted connection to a thread, which
+     * then owns it for its whole lifetime) the effect is that one thread keeps
+     * being handed new connections until it is saturated, then the next one
+     * fills, and so on.  Backlog counts in-flight deferrals, not connections
+     * owned, so it never reflects the accumulated load and the decision is
+     * never revisited.  With keepalive connections the head of the list ends
+     * up pinned at 100% CPU while the tail sits idle.
+     *
+     * Starting at a rotating offset makes the common case (several threads
+     * with an empty backlog) round-robin, while still preferring an idle
+     * thread over a backed-up one and still falling back to the least-loaded
+     * thread when every thread is busy.
+     *
+     * rr_next is only advanced here.  evthr_pool_defer() is called from the
+     * acceptor thread, and a stale or torn read would merely shift the
+     * starting offset, so no locking is needed for what is a scheduling hint.
+     */
+    if (pool->nthreads > 0) {
+        skip = pool->rr_next++ % (unsigned int)pool->nthreads;
+    } else {
+        skip = 0;
+    }
 
-    TAILQ_FOREACH(thread, &pool->threads, next) {
+    thread = TAILQ_FIRST(&pool->threads);
+
+    for (i = 0; i < skip && thread != NULL; i++) {
+        thread = TAILQ_NEXT(thread, next);
+    }
+
+    if (thread == NULL) {
+        thread = TAILQ_FIRST(&pool->threads);
+    }
+
+    /* Walk the whole ring once, starting from the rotated offset. */
+    for (i = 0; thread != NULL && i < (unsigned int)pool->nthreads; i++) {
         int backlog = get_backlog_(thread);
 
         if (backlog == 0) {
@@ -429,6 +471,18 @@ evthr_pool_defer(evthr_pool_t * pool, evthr_cb cb, void * arg)
             min_thread  = thread;
             min_backlog = backlog;
         }
+
+        if (!(thread = TAILQ_NEXT(thread, next))) {
+            thread = TAILQ_FIRST(&pool->threads);
+        }
+    }
+
+    /* The loop above is bounded by nthreads rather than by the list itself, so
+     * unlike the plain TAILQ_FOREACH it does not run at all if nthreads is not
+     * positive.  evthr_defer() dereferences its argument without checking, so
+     * refuse explicitly rather than fault. */
+    if (min_thread == NULL) {
+        return EVTHR_RES_FATAL;
     }
 
     return evthr_defer(min_thread, cb, arg);
